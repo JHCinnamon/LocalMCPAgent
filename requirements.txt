@@ -1,3 +1,5 @@
 typing
 ollama
 mcp
+json
+asyncio
