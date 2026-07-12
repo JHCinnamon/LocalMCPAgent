@@ -59,15 +59,15 @@ class Orchestrator:
             }
 
         instruction = f"""
-                        Goal:
-                        {plan.goal}
+Goal:
+{plan.goal}
 
-                        Execution Plan:
+Execution Plan:
 
-                        {chr(10).join(plan.steps)}
+{chr(10).join(plan.steps)}
 
-                        Carry out this plan using available MCP tools.
-                        """
+Carry out this plan using available MCP tools.
+"""
 
         result = await self.mcp.execute(instruction)
 
