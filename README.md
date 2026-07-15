@@ -1,4 +1,4 @@
-# Zapier MCP Discussion
+# "Concierge" Zapier MCP Agent
 
 A Windows desktop chat application that uses a local Ollama model to discuss and invoke tools exposed by a Zapier remote MCP server. The desktop UI is deliberately limited to the conversation history and message composer.
 
