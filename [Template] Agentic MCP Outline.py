@@ -3,11 +3,9 @@
 import asyncio
 import importlib.util
 import json
-import os
 import subprocess
 import sys
 import threading
-import webbrowser
 from pathlib import Path
 from typing import Any, Dict
 
@@ -16,14 +14,9 @@ REQUIRED_PACKAGES = {
     "ollama": "ollama",
     "ollmcp": "ollmcp",
     "mcp": "mcp",
-    "cryptography": "cryptography",
-    "keyring": "keyring",
 }
 OLLAMA_MODEL = "qwen3.5:35b"
 OLLAMA_HOST = "http://localhost:11434"
-ZAPIER_MCP_PORTAL = "https://mcp.zapier.com/"
-ZAPIER_MCP_URL = "https://mcp.zapier.com/api/v1/connect"
-DEFAULT_MCP_URL = ZAPIER_MCP_URL
 
 
 def ensure_packages() -> None:
@@ -40,63 +33,16 @@ def ensure_packages() -> None:
 ensure_packages()
 
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import scrolledtext, ttk
 
 from ollama import Client
-from cryptography.fernet import Fernet, InvalidToken
-import keyring
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 
-class EncryptedCredentialStore:
-    """Stores replaceable named credentials encrypted with an OS-protected key."""
-
-    SERVICE_NAME = "ZapierMCPAgent"
-    KEY_NAME = "credential-encryption-key"
-
-    def __init__(self, storage_path: Path | None = None):
-        app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-        self.storage_path = storage_path or app_data / self.SERVICE_NAME / "credentials.enc"
-        self.cipher = Fernet(self._load_or_create_key())
-
-    def _load_or_create_key(self) -> bytes:
-        key = keyring.get_password(self.SERVICE_NAME, self.KEY_NAME)
-        if key is None:
-            key = Fernet.generate_key().decode("ascii")
-            keyring.set_password(self.SERVICE_NAME, self.KEY_NAME, key)
-        return key.encode("ascii")
-
-    def load(self, credential_name: str) -> Dict[str, str]:
-        records = self._load_records()
-        return records.get(credential_name, {}).copy()
-
-    def replace(self, credential_name: str, url: str, token: str) -> None:
-        records = self._load_records()
-        records[credential_name] = {"url": url.strip(), "token": token.strip()}
-        self._save_records(records)
-
-    def _load_records(self) -> Dict[str, Dict[str, str]]:
-        if not self.storage_path.exists():
-            return {}
-        try:
-            encrypted_payload = self.storage_path.read_bytes()
-            return json.loads(self.cipher.decrypt(encrypted_payload))
-        except (InvalidToken, OSError, json.JSONDecodeError) as error:
-            raise RuntimeError("Saved credentials could not be decrypted.") from error
-
-    def _save_records(self, records: Dict[str, Dict[str, str]]) -> None:
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        encrypted_payload = self.cipher.encrypt(json.dumps(records).encode("utf-8"))
-        temporary_path = self.storage_path.with_suffix(".tmp")
-        temporary_path.write_bytes(encrypted_payload)
-        temporary_path.replace(self.storage_path)
-
-
 class MCPAgent:
-    def __init__(self, mcp_url: str, access_token: str, activity_callback=None):
+    def __init__(self, mcp_url: str, activity_callback=None):
         self.mcp_url = mcp_url
-        self.access_token = access_token
         self.activity_callback = activity_callback or (lambda _: None)
         self.client = Client(host=OLLAMA_HOST)
         self.tool_map: Dict[str, Any] = {}
@@ -106,11 +52,7 @@ class MCPAgent:
 
     async def connect(self) -> None:
         self.activity_callback("Connecting to Zapier MCP server...")
-        authorization = self.access_token
-        if authorization and not authorization.lower().startswith("bearer "):
-            authorization = f"Bearer {authorization}"
-        headers = {"Authorization": authorization} if authorization else None
-        self.http_ctx = streamablehttp_client(self.mcp_url, headers=headers)
+        self.http_ctx = streamablehttp_client(self.mcp_url)
         read_stream, write_stream, _ = await self.http_ctx.__aenter__()
         self.session = ClientSession(read_stream, write_stream)
         await self.session.initialize()
@@ -142,7 +84,7 @@ class MCPAgent:
             raise RuntimeError("MCP session is not connected.")
         return await self.session.call_tool(name, arguments)
 
-    async def run(self, user_question: str) -> str:
+    async def run(self, conversation: list[Dict[str, str]]) -> str:
         messages = [
             {
                 "role": "system",
@@ -154,7 +96,7 @@ class MCPAgent:
                     "an irreversible external change."
                 ),
             },
-            {"role": "user", "content": user_question},
+            *conversation,
         ]
 
         while True:
@@ -189,100 +131,86 @@ class MCPAgent:
 
 
 class ZapierAgentApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, mcp_url: str):
         super().__init__()
-        self.title("Zapier MCP Agent")
+        self.mcp_url = mcp_url
+        self.title("Zapier Discussion")
         self.minsize(760, 560)
         self.geometry("900x680")
-        self.credential_store = EncryptedCredentialStore()
-        saved_credential = self.credential_store.load("zapier")
-        self.endpoint_var = tk.StringVar(value=DEFAULT_MCP_URL)
-        self.token_var = tk.StringVar(value=saved_credential.get("token", ""))
-        self.status_var = tk.StringVar(value="Checking Ollama...")
+        self.conversation: list[Dict[str, str]] = []
+        self._configure_ollmcp_theme()
         self._build_ui()
-        threading.Thread(target=self._check_ollama, daemon=True).start()
+
+    def _configure_ollmcp_theme(self) -> None:
+        colors = {
+            "ink": "#10151f",
+            "surface": "#18212f",
+            "cyan": "#5eead4",
+            "amber": "#fbbf24",
+            "text": "#e5edf5",
+            "muted": "#a4b1c1",
+        }
+        self.configure(background=colors["ink"])
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(
+            "OllMCP.TButton",
+            background=colors["cyan"],
+            foreground=colors["ink"],
+            borderwidth=0,
+            font=("Segoe UI Semibold", 10),
+            padding=(16, 10),
+        )
+        style.map(
+            "OllMCP.TButton",
+            background=[("active", colors["amber"]), ("disabled", colors["surface"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        self.colors = colors
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
-        connection_frame = ttk.LabelFrame(self, text="Zapier MCP Connection", padding=12)
-        connection_frame.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
-        connection_frame.columnconfigure(1, weight=1)
-        ttk.Label(connection_frame, text="MCP endpoint:").grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
-        )
-        self.endpoint_entry = ttk.Entry(connection_frame, textvariable=self.endpoint_var)
-        self.endpoint_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(
-            connection_frame, text="Log in to Zapier", command=self._open_zapier_login
-        ).grid(row=0, column=2, padx=(8, 0))
-        ttk.Label(
-            connection_frame,
-            text="Uses Zapier's streamable HTTP connection URL. Enter your secret token below.",
-        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Label(connection_frame, text="Access token:").grid(
-            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
-        )
-        self.token_entry = ttk.Entry(
-            connection_frame, textvariable=self.token_var, show="*"
-        )
-        self.token_entry.grid(row=2, column=1, sticky="ew", pady=(8, 0))
-        ttk.Button(
-            connection_frame, text="Save encrypted", command=self._save_credential
-        ).grid(row=2, column=2, padx=(8, 0), pady=(8, 0))
-
-        status_frame = ttk.Frame(self, padding=(16, 0))
-        status_frame.grid(row=1, column=0, sticky="ew")
-        ttk.Label(status_frame, text="Model:").pack(side="left")
-        ttk.Label(status_frame, text=OLLAMA_MODEL).pack(side="left", padx=(5, 20))
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side="left")
+        self.rowconfigure(0, weight=1)
 
         self.transcript = scrolledtext.ScrolledText(
-            self, wrap=tk.WORD, state=tk.DISABLED, font=("Segoe UI", 10)
+            self,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=("Segoe UI", 11),
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=18,
+            pady=18,
         )
-        self.transcript.grid(row=2, column=0, sticky="nsew", padx=14, pady=8)
+        self.transcript.tag_configure("user", foreground=self.colors["cyan"], font=("Segoe UI Semibold", 10))
+        self.transcript.tag_configure("agent", foreground=self.colors["amber"], font=("Segoe UI Semibold", 10))
+        self.transcript.tag_configure("body", foreground=self.colors["text"], spacing3=16)
+        self.transcript.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 8))
 
-        prompt_frame = ttk.Frame(self, padding=(14, 0, 14, 14))
-        prompt_frame.grid(row=3, column=0, sticky="ew")
+        prompt_frame = tk.Frame(self, background=self.colors["ink"], padx=14, pady=14)
+        prompt_frame.grid(row=1, column=0, sticky="ew")
         prompt_frame.columnconfigure(0, weight=1)
-        self.prompt = tk.Text(prompt_frame, height=4, wrap=tk.WORD, font=("Segoe UI", 10))
+        self.prompt = tk.Text(
+            prompt_frame,
+            height=3,
+            wrap=tk.WORD,
+            font=("Segoe UI", 11),
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief=tk.FLAT,
+            padx=12,
+            pady=10,
+        )
         self.prompt.grid(row=0, column=0, sticky="ew")
         self.prompt.bind("<Control-Return>", self._submit_from_shortcut)
-        self.send_button = ttk.Button(prompt_frame, text="Send", command=self._submit)
+        self.send_button = ttk.Button(
+            prompt_frame, text="Send", style="OllMCP.TButton", command=self._submit
+        )
         self.send_button.grid(row=0, column=1, sticky="ns", padx=(8, 0))
-
-    def _open_zapier_login(self) -> None:
-        webbrowser.open(ZAPIER_MCP_PORTAL)
-        self.status_var.set("Browser opened. Sign in to Zapier and create or copy a secret token.")
-
-    def _save_credential(self) -> None:
-        endpoint = self.endpoint_var.get().strip()
-        token = self.token_var.get().strip()
-        if not endpoint or not token:
-            messagebox.showwarning(
-                "URL and token required",
-                "Enter both the Zapier MCP endpoint and its access token before saving.",
-            )
-            return
-        try:
-            self.credential_store.replace("zapier", endpoint, token)
-            self.status_var.set("Zapier credentials saved with encryption")
-        except Exception as error:
-            messagebox.showerror("Credential storage failed", str(error))
-
-    def _check_ollama(self) -> None:
-        client = Client(host=OLLAMA_HOST)
-        try:
-            response = client.list()
-            models = response.models if hasattr(response, "models") else response.get("models", [])
-            model_names = {
-                model.model if hasattr(model, "model") else model.get("model", "")
-                for model in models
-            }
-            status = "Ollama is ready" if OLLAMA_MODEL in model_names else f"Run: ollama pull {OLLAMA_MODEL}"
-        except Exception:
-            status = "Ollama is unavailable. Start it with: ollama serve"
-        self.after(0, self.status_var.set, status)
 
     def _submit_from_shortcut(self, _event):
         self._submit()
@@ -290,59 +218,85 @@ class ZapierAgentApp(tk.Tk):
 
     def _submit(self) -> None:
         question = self.prompt.get("1.0", tk.END).strip()
-        endpoint = self.endpoint_var.get().strip()
-        token = self.token_var.get().strip()
         if not question:
-            return
-        if not endpoint:
-            messagebox.showwarning(
-                "Zapier MCP endpoint required",
-                "Enter the Zapier streamable HTTP URL before sending.",
-            )
-            return
-        if not token:
-            messagebox.showwarning(
-                "Zapier access token required",
-                "Enter the access token for this Zapier MCP endpoint before sending.",
-            )
             return
 
         self.prompt.delete("1.0", tk.END)
+        self.conversation.append({"role": "user", "content": question})
         self._append("You", question)
         self.send_button.configure(state=tk.DISABLED)
-        self.status_var.set("Working...")
         threading.Thread(
-            target=self._run_agent, args=(endpoint, token, question), daemon=True
+            target=self._run_agent, args=(self.conversation.copy(),), daemon=True
         ).start()
 
-    def _run_agent(self, endpoint: str, token: str, question: str) -> None:
+    def _run_agent(self, conversation: list[Dict[str, str]]) -> None:
         async def execute() -> str:
-            agent = MCPAgent(endpoint, token, self._set_status_threadsafe)
+            agent = MCPAgent(self.mcp_url)
             try:
                 await agent.connect()
-                return await agent.run(question)
+                return await agent.run(conversation)
             finally:
                 await agent.close()
 
         try:
             answer = asyncio.run(execute())
-            self.after(0, self._append, "Agent", answer)
-            self.after(0, self.status_var.set, "Ready")
+            self.after(0, self._append_answer, answer)
         except Exception as error:
             self.after(0, self._append, "Error", str(error))
-            self.after(0, self.status_var.set, "Connection or tool request failed")
         finally:
             self.after(0, self.send_button.configure, {"state": tk.NORMAL})
 
-    def _set_status_threadsafe(self, status: str) -> None:
-        self.after(0, self.status_var.set, status)
-
     def _append(self, speaker: str, text: str) -> None:
         self.transcript.configure(state=tk.NORMAL)
-        self.transcript.insert(tk.END, f"{speaker}:\n{text}\n\n")
+        tag = "user" if speaker == "You" else "agent"
+        self.transcript.insert(tk.END, f"{speaker}\n", tag)
+        self.transcript.insert(tk.END, f"{text}\n\n", "body")
         self.transcript.configure(state=tk.DISABLED)
         self.transcript.see(tk.END)
 
+    def _append_answer(self, answer: str) -> None:
+        self.conversation.append({"role": "assistant", "content": answer})
+        self._append("Agent", answer)
+
+
+def _run_ollmcp_login(mcp_url: str) -> None:
+    print("\nOpening OllMCP for Zapier sign-in. Complete any browser login, then exit OllMCP to continue.")
+    ollmcp_executable = Path(sys.executable).with_name("ollmcp.exe")
+    try:
+        subprocess.run(
+            [str(ollmcp_executable), "--mcp-server-url", mcp_url, "--model", OLLAMA_MODEL],
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("OllMCP is not installed or is unavailable on PATH.") from error
+
+
+def _connect_before_launch(mcp_url: str) -> None:
+    async def verify() -> None:
+        agent = MCPAgent(mcp_url)
+        try:
+            await agent.connect()
+        finally:
+            await agent.close()
+
+    asyncio.run(verify())
+
+
+def bootstrap() -> str:
+    print("Zapier MCP setup")
+    mcp_url = input("Paste your Zapier MCP connection URL: ").strip()
+    if not mcp_url:
+        raise RuntimeError("A Zapier MCP connection URL is required.")
+    _run_ollmcp_login(mcp_url)
+    print("\nVerifying the Zapier MCP connection...")
+    _connect_before_launch(mcp_url)
+    print("Connected. Opening the Zapier discussion window.")
+    return mcp_url
+
 
 if __name__ == "__main__":
-    ZapierAgentApp().mainloop()
+    try:
+        ZapierAgentApp(bootstrap()).mainloop()
+    except Exception as error:
+        print(f"Unable to connect to Zapier MCP: {error}", file=sys.stderr)
+        sys.exit(1)
