@@ -1,4 +1,4 @@
-# Zapier MCP Agent
+# "Concierge" Zapier MCP Agent
 
 A Windows desktop application that uses a local Ollama model to answer prompts and invoke tools exposed by Zapier's remote MCP server.
 
